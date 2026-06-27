@@ -22,11 +22,11 @@ from enum import Enum, auto
 
 
 class ComplexityLevel(Enum):
-    L1 = 1   # 1 class,  2 methods,  6H+2S constraints
-    L2 = 2   # 3 classes, 8 methods,  6H+2S+2soft
-    L3 = 3   # 5 classes, 20 methods, 8H+4S+3soft
-    L4 = 4   # 10 classes, 50 methods, 10H+6S+4soft
-    L5 = 5   # 20 classes, 100 methods, 12H+8S+5soft
+    L1 = 1   # 1 class,  2 methods,  8H+2S+2soft constraints
+    L2 = 2   # 3 classes, 9 methods,  9H+2S+2soft
+    L3 = 3   # 5 classes, 20 methods, 9H+2S+2soft
+    L4 = 4   # 10 classes, 50 methods, 9H+2S+2soft
+    L5 = 5   # 20 classes, 100 methods, 9H+2S+2soft
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +43,17 @@ class ComplexityProfile:
 
 
 COMPLEXITY_PROFILES: dict[ComplexityLevel, ComplexityProfile] = {
-    ComplexityLevel.L1: ComplexityProfile(ComplexityLevel.L1,  1,   2,  6,  2, 0,  3,   5),
-    ComplexityLevel.L2: ComplexityProfile(ComplexityLevel.L2,  3,   3,  6,  2, 2,  5,  10),
-    ComplexityLevel.L3: ComplexityProfile(ComplexityLevel.L3,  5,   4,  8,  4, 3, 10,  20),
-    ComplexityLevel.L4: ComplexityProfile(ComplexityLevel.L4, 10,   5, 10,  6, 4, 20,  40),
-    ComplexityLevel.L5: ComplexityProfile(ComplexityLevel.L5, 20,   5, 12,  8, 5, 40,  80),
+    # n_hard_constraints updated to match what build_neoforge_constraint_graph()
+    # actually produces (8 at n_classes=1, 9 once n_classes>=2 -- see
+    # constraint_graph.py / RVP_specification.md's revision note). These
+    # fields were previously decorative placeholders never wired into the
+    # harness; n_strong/n_soft remain 2/2 at every level -- no new STRONG or
+    # SOFT constraints were added in this pass, only HARD ones.
+    ComplexityLevel.L1: ComplexityProfile(ComplexityLevel.L1,  1,   2,  8,  2, 2,  3,   5),
+    ComplexityLevel.L2: ComplexityProfile(ComplexityLevel.L2,  3,   3,  9,  2, 2,  5,  10),
+    ComplexityLevel.L3: ComplexityProfile(ComplexityLevel.L3,  5,   4,  9,  2, 2, 10,  20),
+    ComplexityLevel.L4: ComplexityProfile(ComplexityLevel.L4, 10,   5,  9,  2, 2, 20,  40),
+    ComplexityLevel.L5: ComplexityProfile(ComplexityLevel.L5, 20,   5,  9,  2, 2, 40,  80),
 }
 
 

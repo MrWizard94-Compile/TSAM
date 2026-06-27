@@ -35,6 +35,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Protocol, runtime_checkable
@@ -85,6 +86,7 @@ class ProgramNode:
     parent_class_id: str | None = None     # node_id of enclosing ClassDef, if any
     body_api_refs: tuple[str, ...] = ()    # CLASS nodes only: every Name/Attribute ref anywhere in the subtree
     capability_evidence: bool = False      # CLASS nodes only: see class_shows_capability_provider_evidence
+    structural_capability_keys: tuple[str, ...] = ()  # CLASS nodes only: see class_capability_keys
 
     @classmethod
     def from_ast_node(
@@ -289,6 +291,134 @@ def class_shows_capability_provider_evidence(cdef: ast.ClassDef) -> bool:
     return any(marker in ref for ref in refs for marker in CAPABILITY_EVIDENCE_MARKERS)
 
 
+_CAPABILITY_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _extract_capability_key_candidates(body_api_refs: tuple[str, ...]) -> set[str]:
+    """
+    NAMING-HEURISTIC FALLBACK ONLY -- see class_capability_keys(), which
+    prefers _extract_structural_capability_keys() and only falls back to
+    this when no structural signal exists at all.
+
+    Identify which references in a class's body look like a capability-key
+    constant (e.g. MY_CAP_0, MY_CAPABILITY_3): all-caps identifiers
+    containing "CAP". This is purely a spelling match and has two known
+    failure modes that the structural detector below fixes: (1) false
+    positive on any unrelated all-caps constant that happens to contain
+    "CAP" (e.g. MAX_CAPACITY) even though it's never used as a capability
+    key; (2) false negative on a genuine key that doesn't happen to follow
+    this naming convention (e.g. kSharedCapId). Kept only as a last
+    resort for classes with no `cap`-parameter method to anchor on.
+    """
+    return {
+        ref for ref in body_api_refs
+        if _CAPABILITY_KEY_PATTERN.match(ref) and "CAP" in ref
+    }
+
+
+def _extract_structural_capability_keys(cdef: ast.ClassDef) -> set[str]:
+    """
+    Identify capability-key identifiers by structural ROLE rather than by
+    spelling: the value compared against a parameter literally named
+    `cap`, within any method that has such a parameter (the convention
+    both the Fabric and NeoForge templates in this benchmark use for
+    their capability-accessor method, e.g. `getCapability(self, cap, side)`).
+
+    This is what fixes two real bugs found by adversarial testing of the
+    naming-heuristic-only version (_extract_capability_key_candidates):
+      - False positive: two classes that each incidentally reference an
+        unrelated all-caps "CAP"-containing constant (e.g. MAX_CAPACITY)
+        got flagged as a key collision even though their real keys
+        (MY_CAP_A vs MY_CAP_B) were distinct.
+      - False negative: two classes genuinely sharing a key spelled in a
+        style the naming regex doesn't match (e.g. kSharedCapId) were
+        silently accepted despite a real registration collision.
+
+    Includes a single-hop, same-method def-use resolution step (e.g.
+    `key = MY_CAP_A; if cap == key:` resolves to MY_CAP_A) -- deliberately
+    narrow: no cross-method or cross-class resolution, no fixed-point
+    analysis, just one assignment hop within the same method body.
+    """
+    keys: set[str] = set()
+
+    for method in ast.walk(cdef):
+        if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        param_names = {a.arg for a in method.args.args}
+        if "cap" not in param_names:
+            continue
+
+        # Single-hop def-use: resolve simple `name = <Name|Attribute>`
+        # assignments within this same method, so a key referenced via a
+        # local alias is still found.
+        local_aliases: dict[str, str] = {}
+        for stmt in ast.walk(method):
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                target_name = stmt.targets[0].id
+                value = stmt.value
+                if isinstance(value, ast.Name):
+                    local_aliases[target_name] = value.id
+                elif isinstance(value, ast.Attribute):
+                    try:
+                        local_aliases[target_name] = ast.unparse(value)
+                    except Exception:
+                        pass
+
+        def _resolve(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                if node.id == "cap":
+                    return None
+                return local_aliases.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                try:
+                    return ast.unparse(node)
+                except Exception:
+                    return None
+            return None
+
+        for node in ast.walk(method):
+            if not isinstance(node, ast.Compare):
+                continue
+            if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+                continue
+            left, right = node.left, node.comparators[0]
+            is_left_cap  = isinstance(left, ast.Name) and left.id == "cap"
+            is_right_cap = isinstance(right, ast.Name) and right.id == "cap"
+            if is_left_cap and not is_right_cap:
+                key = _resolve(right)
+            elif is_right_cap and not is_left_cap:
+                key = _resolve(left)
+            else:
+                continue
+            if key:
+                keys.add(key)
+
+    return keys
+
+
+def class_capability_keys(cdef: ast.ClassDef) -> set[str]:
+    """
+    The canonical way to determine a class's capability-key identifier(s).
+    Prefers structural detection (_extract_structural_capability_keys);
+    falls back to the naming-convention heuristic only if no `cap`-
+    parameter method exists at all, so a class using some other accessor
+    convention still gets *a* signal rather than none. (The fallback path
+    retains the naming heuristic's known false-positive risk -- acceptable
+    here since every capability-accessor method in this domain's actual
+    templates has a `cap` parameter, so the fallback should rarely fire
+    for genuine capability providers.)
+    """
+    structural = _extract_structural_capability_keys(cdef)
+    if structural:
+        return structural
+    refs = _collect_subtree_refs(cdef)
+    return _extract_capability_key_candidates(tuple(sorted(refs)))
+
+
 # ---------------------------------------------------------------------------
 # Program Graph P_t
 # ---------------------------------------------------------------------------
@@ -360,11 +490,13 @@ class ProgramGraph:
 
                 body_refs = _collect_subtree_refs(node)
                 evidence  = class_shows_capability_provider_evidence(node)
+                cap_keys  = class_capability_keys(node)
                 old_class_node = self.nodes[class_node_id]
                 self.nodes[class_node_id] = replace(
                     old_class_node,
                     body_api_refs       = tuple(sorted(body_refs)),
                     capability_evidence = evidence,
+                    structural_capability_keys = tuple(sorted(cap_keys)),
                 )
 
         # Fidelity: ratio of source lines represented by nodes
@@ -508,13 +640,24 @@ REQUIRED_METHODS: frozenset[str] = frozenset({
 })
 
 
-def build_neoforge_constraint_graph() -> ConstraintGraph:
+def build_neoforge_constraint_graph(n_classes: int = 1) -> ConstraintGraph:
     """
     Build the Stage 0 benchmark Constraint Graph for:
     'Port a Fabric capability provider to NeoForge 1.20.1'
 
-    7 hard constraints, 2 strong constraints, 2 soft constraints.
-    Matches TSAM Formal Spec Definition 2 structure.
+    8 hard constraints, 2 strong constraints, 2 soft constraints at
+    n_classes=1; 9 hard once n_classes >= 2 (see MUST_HAVE_UNIQUE_CAPABILITY_KEYS
+    below). Matches TSAM Formal Spec Definition 2 structure.
+
+    n_classes: structural-complexity hint used to decide which CROSS-CLASS
+    constraints are active. With a single class there's nothing to compare
+    across classes, so a cross-class constraint like "no two classes share
+    a capability key" is vacuous -- it's simply not included, rather than
+    included and trivially always passing. This makes "active constraint
+    count" (RVP_specification.md axis 2) a real, varying quantity instead
+    of a fixed graph where some checks just happen to never fire. Use
+    build_neoforge_constraint_graph_for_source() to derive n_classes from
+    an actual source automatically.
     """
     g = ConstraintGraph()
 
@@ -583,6 +726,34 @@ def build_neoforge_constraint_graph() -> ConstraintGraph:
         check_param   = "",
     ))
 
+    g.add(Constraint(
+        constraint_id = "MUST_NOT_LEAVE_DANGLING_FABRIC_REFS",
+        description   = (
+            "Even capability-provider classes must not retain forbidden "
+            "Fabric API calls in their body (complements MUST_MATCH_KNOWN_PATTERN, "
+            "which only covers classes with no capability evidence at all -- "
+            "a genuine capability provider can incidentally also contain a "
+            "leftover Fabric call, e.g. in __init__)"
+        ),
+        priority      = ConstraintPriority.HARD,
+        check_kind    = "no_forbidden_refs_in_evidence_class_body",
+        check_param   = "",
+    ))
+
+    if n_classes >= 2:
+        g.add(Constraint(
+            constraint_id = "MUST_HAVE_UNIQUE_CAPABILITY_KEYS",
+            description   = (
+                "No two capability-provider classes in the same file may "
+                "register under the same capability-key identifier -- a "
+                "real registration collision, only checkable (and only "
+                "meaningful) once there is more than one class to compare"
+            ),
+            priority      = ConstraintPriority.HARD,
+            check_kind    = "unique_capability_keys",
+            check_param   = "",
+        ))
+
     # ------------------------------------------------------------------
     # STRONG CONSTRAINTS (large energy penalty, repair required)
     # ------------------------------------------------------------------
@@ -632,6 +803,23 @@ def build_neoforge_constraint_graph() -> ConstraintGraph:
     g.add_edge("MUST_HAVE_CAPABILITY_METHOD", "MUST_REGISTER_CAPABILITY", "enables")
 
     return g
+
+
+def build_neoforge_constraint_graph_for_source(source: str) -> ConstraintGraph:
+    """
+    Convenience wrapper: count classes in `source` and build the
+    appropriately-scaled constraint graph. Callers processing a real
+    source (the computational loop, the RVP harness) should use this
+    instead of calling build_neoforge_constraint_graph() with no
+    argument, or cross-class constraints will silently never activate
+    regardless of how many classes the source actually has.
+    """
+    try:
+        tree = ast.parse(source)
+        n_classes = sum(1 for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
+    except SyntaxError:
+        n_classes = 1
+    return build_neoforge_constraint_graph(max(n_classes, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +993,44 @@ def check_constraint(
                 f"Class(es) {bad} reference forbidden Fabric APIs in their body but show "
                 f"no capability-provider pattern Stage 0 can rewrite — outside the "
                 f"verified knowledge manifold"
+            ) if not ok else ""
+            return ConstraintResult(c.constraint_id, c.priority, ok, msg)
+
+        case "no_forbidden_refs_in_evidence_class_body":
+            # Complements fabric_entanglement_requires_evidence: that one
+            # catches classes with NO capability evidence at all; this one
+            # catches evidence-bearing classes that nonetheless still have
+            # a leftover Fabric-API call somewhere in their body (e.g. a
+            # capability provider that's also, incidentally, a leftover
+            # Fabric event registrant).
+            bad = [
+                n.name for n in graph.nodes.values()
+                if n.kind == NodeKind.CLASS
+                and n.capability_evidence
+                and any(forbidden in ref for ref in n.body_api_refs for forbidden in FABRIC_APIS)
+            ]
+            ok  = len(bad) == 0
+            msg = (
+                f"Capability-provider class(es) {bad} still reference forbidden "
+                f"Fabric APIs in their body"
+            ) if not ok else ""
+            return ConstraintResult(c.constraint_id, c.priority, ok, msg)
+
+        case "unique_capability_keys":
+            evidence_nodes = [
+                n for n in graph.nodes.values()
+                if n.kind == NodeKind.CLASS and n.capability_evidence
+            ]
+            key_to_classes: dict[str, list[str]] = {}
+            for n in evidence_nodes:
+                for key in n.structural_capability_keys:
+                    key_to_classes.setdefault(key, []).append(n.name)
+            collisions = {k: v for k, v in key_to_classes.items() if len(v) > 1}
+            ok  = len(collisions) == 0
+            msg = (
+                f"Capability key collision(s): {collisions} -- multiple classes "
+                f"reference the same capability-key identifier, which would "
+                f"collide at registration time"
             ) if not ok else ""
             return ConstraintResult(c.constraint_id, c.priority, ok, msg)
 

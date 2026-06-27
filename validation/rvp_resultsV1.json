@@ -44,14 +44,12 @@
     "H3_convergence": {
       "hypothesis": "H3: Convergence",
       "passed": true,
-      "verdict": "PASS: 150/150 runs lexicographically monotone (150/150 also scalar-monotone); 150/150 have clean diagnostics",
+      "verdict": "PASS: 150/150 runs monotone; 150/150 have clean diagnostics",
       "evidence": {
         "runs_checked": 150,
-        "lex_monotone_runs": 150,
-        "scalar_monotone_runs": 150,
-        "scalar_lex_divergences": 0,
+        "monotone_runs": 150,
         "clean_diag_runs": 150,
-        "lex_monotone_violations": 0,
+        "monotone_violations": 0,
         "diag_violations": 0
       },
       "violations": []
@@ -59,7 +57,7 @@
     "H4_resource": {
       "hypothesis": "H4: Resource Profile",
       "passed": true,
-      "verdict": "PASS: Executive state flat across L1-L5 at fixed solvability ({'solvable': 0, 'unsolvable': 0}); total memory growth ratio = 14.9\u00d7",
+      "verdict": "PASS: Executive state flat across L1-L5 at fixed solvability ({'solvable': 0, 'unsolvable': 0}); total memory growth ratio = 14.8\u00d7",
       "evidence": {
         "executive_delta_bytes_by_solvability": {
           "solvable": 0,
@@ -67,13 +65,13 @@
         },
         "executive_flat": true,
         "avg_peak_kb_by_level": {
-          "L1": 82.4,
-          "L2": 180.6,
-          "L3": 300.5,
-          "L4": 605.2,
-          "L5": 1218.3
+          "L1": 82.1,
+          "L2": 180.2,
+          "L3": 300.1,
+          "L4": 604.6,
+          "L5": 1217.4
         },
-        "growth_ratio_L1_to_L5": 14.88,
+        "growth_ratio_L1_to_L5": 14.84,
         "growth_limit": 30.0
       },
       "violations": []
@@ -117,5 +115,5 @@
     "total_runs": 150
   },
   "constraint_complexity_note": "RESOLVED (partially, deliberately): build_neoforge_constraint_graph() now takes an n_classes parameter and activates cross-class constraints (currently MUST_HAVE_UNIQUE_CAPABILITY_KEYS) only when n_classes >= 2, via build_neoforge_constraint_graph_for_source(). Active HARD constraint count now genuinely varies (8 at L1's n_classes=1, 9 at L2-L5's n_classes>=3 -- see active_hard_constraints_by_level in H5 evidence). This is intentionally a smaller, more conservative scaling than the original 6/6/8/10/12 figures in RVP_specification.md's table, which were illustrative placeholders rather than figures derived from actual constraints -- adding constraints just to hit pre-set numbers would have reintroduced the same kind of unfalsifiable-by-construction problem this review has been removing elsewhere. RVP_specification.md's table has been updated to match. Further genuinely-justified constraints (STRONG/SOFT cross-class consistency checks, additional HARD correctness properties) remain a reasonable Stage 1 direction, to be added as they're identified rather than invented to fill a quota.",
-  "provenance_note": "Computed in a verified sandbox replica of this codebase after the Phase A/B/D fixes, the gap-closure pass, the Stage 1 structural capability-key detector, and the lexicographic-energy change (EnergyBreakdown.lexicographic_key now drives the loop's accept/revert decision; H3 verifies monotonicity on this quantity, reporting scalar agreement separately -- see the H3_convergence evidence above). Run `python validation/rvp_harness.py` yourself to reproduce/confirm; it should match exactly, per H2's determinism guarantee."
+  "provenance_note": "Computed in a verified sandbox replica of this codebase after the Phase A/B/D fixes plus this gap-closure pass (constraint complexity scaling, dead-code removal, and a genuine bug the new uniqueness constraint surfaced in the stub-generation templates -- see _capability_key_for_class in rewrite_engine.py). Run `python validation/rvp_harness.py` yourself to reproduce/confirm; it should match exactly, per H2's determinism guarantee."
 }

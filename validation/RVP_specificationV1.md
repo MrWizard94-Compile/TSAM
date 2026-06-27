@@ -179,13 +179,32 @@ and diagnostic quality as complexity increases.
 
 **Complexity level definitions:**
 
-| Level | Classes | Methods | Constraints | Expected rewrites |
+| Level | Classes | Methods | Constraints (HARD/STRONG/SOFT, active) | Expected rewrites |
 |---|---|---|---|---|
-| L1 | 1 | 2 | 6 HARD, 2 STRONG | 3–5 |
-| L2 | 3 | 8 | 6 HARD, 2 STRONG, 2 SOFT | 5–10 |
-| L3 | 5 | 20 | 8 HARD, 4 STRONG, 3 SOFT | 10–20 |
-| L4 | 10 | 50 | 10 HARD, 6 STRONG, 4 SOFT | 20–40 |
-| L5 | 20 | 100 | 12 HARD, 8 STRONG, 5 SOFT | 40–80 |
+| L1 | 1 | 2 | 8 / 2 / 2 | 3–5 |
+| L2 | 3 | 9 | 9 / 2 / 2 | 5–10 |
+| L3 | 5 | 20 | 9 / 2 / 2 | 10–20 |
+| L4 | 10 | 50 | 9 / 2 / 2 | 20–40 |
+| L5 | 20 | 100 | 9 / 2 / 2 | 40–80 |
+
+**Revision note (post-Stage-0-review):** the constraint counts above were
+updated from this document's original 6/6/8/10/12 HARD figures, which were
+illustrative placeholders rather than figures derived from actual
+constraints, and were never wired into the harness (`build_neoforge_
+constraint_graph()` returned the same fixed graph at every level regardless
+of what this table said). The current counts come from
+`build_neoforge_constraint_graph(n_classes)`, which activates
+MUST_NOT_LEAVE_DANGLING_FABRIC_REFS unconditionally (raising the L1 baseline
+from 7 to 8 HARD) and MUST_HAVE_UNIQUE_CAPABILITY_KEYS once n_classes >= 2
+(9 HARD at L2 and above). This is intentionally a smaller, two-tier scaling
+rather than a full five-tier gradient: adding constraints purely to hit a
+pre-set number per level would reintroduce exactly the kind of
+unfalsifiable-by-construction problem this validation phase exists to catch.
+Additional genuinely-justified cross-class constraints (consistency checks
+at STRONG/SOFT priority, further HARD correctness properties) remain a
+reasonable direction for Stage 1, to be added as they're identified rather
+than invented to fill a quota. See `constraint_complexity_note` in
+`rvp_results.json` for the live, machine-readable version of this note.
 
 **Pass criterion:**
 ```

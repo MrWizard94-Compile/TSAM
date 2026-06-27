@@ -54,6 +54,7 @@ from tsam.task_planner import (
 from tsam.rewrite_engine import (
     ACCEPTANCE_THRESHOLD,
     DeterministicRuleStabilizer,
+    EnergyBreakdown,
     TSAMComputationalLoop,
     VerificationKernel,
     compute_energy,
@@ -708,6 +709,339 @@ class FabricEventOnlyClass:
         self.assertIsNotNone(pattern_violation)
         self.assertIn("FabricEventOnlyClass", pattern_violation["msg"])
         self.assertNotIn("FabricCapabilityProvider", pattern_violation["msg"])
+
+
+class TestStageOneGapClosure(unittest.TestCase):
+    """
+    Tests for the two remaining Stage 0 gaps closed afterward: constraint
+    complexity now genuinely scales with class count, and the previously
+    dead ADAPT_CAPABILITY_BODY-adjacent machinery now does real, exercised
+    work (cleaning a leftover Fabric call out of a genuine capability
+    provider). Both tests deliberately construct an adversarial case
+    rather than just a happy path.
+    """
+
+    def setUp(self) -> None:
+        self.mission = Mission.neoforge_port()
+        self.loop    = TSAMComputationalLoop()
+
+    def _run(self, source: str, budget: int = 30):
+        from tsam.constraint_graph import build_neoforge_constraint_graph_for_source
+        cg = build_neoforge_constraint_graph_for_source(source)
+        state = CognitiveState.initialize(self.mission, max_rewrites=budget)
+        return self.loop.run(source, state, cg, verbose=False), cg
+
+    def test_single_class_source_has_no_uniqueness_constraint(self) -> None:
+        """A single-class file shouldn't even have a vacuous cross-class constraint."""
+        from tsam.constraint_graph import build_neoforge_constraint_graph_for_source
+        source = """\
+import net.fabricmc.fabric
+
+class FabricProvider:
+    def getCapability(self, cap, side):
+        return LazyOptional.of(lambda: self.handler)
+"""
+        cg = build_neoforge_constraint_graph_for_source(source)
+        self.assertNotIn("MUST_HAVE_UNIQUE_CAPABILITY_KEYS", cg.constraints)
+
+    def test_multiclass_source_has_uniqueness_constraint_active(self) -> None:
+        from tsam.constraint_graph import build_neoforge_constraint_graph_for_source
+        source = "\n\n".join(
+            f"class P{i}:\n    def getCapability(self, cap, side):\n        return LazyOptional.empty()"
+            for i in range(3)
+        )
+        cg = build_neoforge_constraint_graph_for_source(source)
+        self.assertIn("MUST_HAVE_UNIQUE_CAPABILITY_KEYS", cg.constraints)
+
+    def test_duplicate_capability_keys_across_classes_rejected(self) -> None:
+        """Two classes that accidentally register under the same capability key must be rejected."""
+        source = """\
+import net.fabricmc.fabric
+
+class FabricProviderA:
+    def __init__(self):
+        self.handler_a = MyHandlerA()
+        self.lazy_a = LazyOptional.of(lambda: self.handler_a)
+
+    def getCapability(self, cap, side):
+        if cap == MY_SHARED_CAP:
+            return self.lazy_a
+        return LazyOptional.empty()
+
+class FabricProviderB:
+    def __init__(self):
+        self.handler_b = MyHandlerB()
+        self.lazy_b = LazyOptional.of(lambda: self.handler_b)
+
+    def getCapability(self, cap, side):
+        if cap == MY_SHARED_CAP:
+            return self.lazy_b
+        return LazyOptional.empty()
+"""
+        (final_graph, final_state, trace), cg = self._run(source)
+        self.assertFalse(
+            trace.accepted,
+            "Two classes sharing the same capability-key identifier must be rejected"
+        )
+        violation_ids = [v["id"] for v in trace.diagnostic.get("constraint_violations", [])]
+        self.assertIn("MUST_HAVE_UNIQUE_CAPABILITY_KEYS", violation_ids)
+
+    def test_distinct_capability_keys_across_classes_still_accepted(self) -> None:
+        """Sanity check: distinct keys across classes must NOT be flagged as a collision."""
+        source = "\n\n".join(
+            f"""\
+import net.fabricmc.fabric
+
+class FabricProvider{i}:
+    def __init__(self):
+        self.handler_{i} = MyHandler{i}()
+        self.lazy_{i} = LazyOptional.of(lambda: self.handler_{i})
+
+    def getCapability(self, cap, side):
+        if cap == MY_CAP_{i}:
+            return self.lazy_{i}
+        return LazyOptional.empty()
+"""
+            for i in range(3)
+        )
+        (final_graph, final_state, trace), cg = self._run(source)
+        self.assertTrue(trace.accepted, "Distinct capability keys must not be flagged as a collision")
+
+    def test_dangling_fabric_call_in_capability_provider_is_cleaned(self) -> None:
+        """A genuine capability provider with an incidental leftover Fabric call must be cleaned, not rejected wholesale."""
+        source = """\
+import net.fabricmc.fabric
+from net.fabricmc import ServerLifecycleEvents
+
+class MixedIntentProvider:
+    def __init__(self):
+        self.handler = MyHandler()
+        self.lazy = LazyOptional.of(lambda: self.handler)
+        ServerLifecycleEvents.SERVER_STARTED.register(self.on_start)
+
+    def on_start(self, server):
+        pass
+
+    def getCapability(self, cap, side):
+        if cap == MY_CAP:
+            return self.lazy
+        return LazyOptional.empty()
+"""
+        (final_graph, final_state, trace), cg = self._run(source)
+        self.assertTrue(
+            trace.accepted,
+            "A genuine capability provider with an incidental leftover Fabric call "
+            "should be cleaned up and accepted, not rejected wholesale"
+        )
+        self.assertNotIn("ServerLifecycleEvents", final_graph.source)
+
+    def test_evidence_class_with_only_dangling_ref_violation_gets_specific_diagnostic(self) -> None:
+        """If somehow unfixed, the dangling-ref violation must be attributed correctly, not confused with MUST_MATCH_KNOWN_PATTERN."""
+        from tsam.constraint_graph import (
+            ProgramGraph, build_neoforge_constraint_graph_for_source, check_all_constraints,
+        )
+        source = """\
+from neoforge.common.capabilities import ICapabilityProvider, LazyOptional
+from net.neoforged.neoforge.capabilities import BlockCapabilityRegistrar
+import net.fabricmc.fabric
+
+class AlreadyPortedButMessy:
+    def getCapability(self, cap, direction=None):
+        net.fabricmc.fabric.legacy_helper()
+        return LazyOptional.empty()
+    def invalidateCapabilities(self):
+        pass
+    def register_capability(self, registrar: BlockCapabilityRegistrar):
+        registrar.registerBlockEntity(MY_CAP, self)
+"""
+        graph = ProgramGraph.from_python_source(source)
+        cg    = build_neoforge_constraint_graph_for_source(source)
+        results = check_all_constraints(graph, cg)
+        violated_ids = {r.constraint_id for r in results if r.violated}
+        self.assertIn("MUST_NOT_LEAVE_DANGLING_FABRIC_REFS", violated_ids)
+        self.assertNotIn("MUST_MATCH_KNOWN_PATTERN", violated_ids)
+
+
+class TestStructuralCapabilityKeyDetection(unittest.TestCase):
+    """
+    Regression tests for the structural (role-based) capability-key
+    detector, which replaced the naming-convention-only heuristic after
+    adversarial testing found it both over- and under-triggers:
+      - False positive: an unrelated all-caps constant containing "CAP"
+        (e.g. MAX_CAPACITY) was wrongly treated as a capability key,
+        causing two classes with genuinely distinct keys to be rejected
+        as a collision.
+      - False negative: two classes genuinely sharing a key spelled in a
+        style the naming regex didn't match (e.g. kSharedCapId) were
+        silently accepted despite a real registration collision.
+    """
+
+    def setUp(self) -> None:
+        self.mission = Mission.neoforge_port()
+        self.loop    = TSAMComputationalLoop()
+
+    def _run(self, source: str, budget: int = 30):
+        from tsam.constraint_graph import build_neoforge_constraint_graph_for_source
+        cg = build_neoforge_constraint_graph_for_source(source)
+        state = CognitiveState.initialize(self.mission, max_rewrites=budget)
+        return self.loop.run(source, state, cg, verbose=False)
+
+    def test_unrelated_shared_constant_is_not_a_false_collision(self) -> None:
+        """Two classes with distinct real keys that also share an unrelated CAP-spelled constant must be accepted."""
+        source = """\
+import net.fabricmc.fabric
+
+class FabricProviderA:
+    def __init__(self):
+        self.handler_a = MyHandlerA()
+        self.lazy_a = LazyOptional.of(lambda: self.handler_a)
+    def getCapability(self, cap, side):
+        if cap == MY_CAP_A:
+            return self.lazy_a
+        return LazyOptional.empty()
+    def helper_a(self):
+        return MAX_CAPACITY
+
+class FabricProviderB:
+    def __init__(self):
+        self.handler_b = MyHandlerB()
+        self.lazy_b = LazyOptional.of(lambda: self.handler_b)
+    def getCapability(self, cap, side):
+        if cap == MY_CAP_B:
+            return self.lazy_b
+        return LazyOptional.empty()
+    def helper_b(self):
+        return MAX_CAPACITY
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertTrue(
+            trace.accepted,
+            "An unrelated shared constant (MAX_CAPACITY) must not be treated as a capability-key collision"
+        )
+
+    def test_non_conventionally_named_collision_is_still_caught(self) -> None:
+        """A genuine collision must be caught even when the shared key doesn't follow the all-caps naming convention."""
+        source = """\
+import net.fabricmc.fabric
+
+class ProviderX:
+    def __init__(self):
+        self.handler_x = MyHandlerX()
+        self.lazy_x = LazyOptional.of(lambda: self.handler_x)
+    def getCapability(self, cap, side):
+        if cap == kSharedCapId:
+            return self.lazy_x
+        return LazyOptional.empty()
+
+class ProviderY:
+    def __init__(self):
+        self.handler_y = MyHandlerY()
+        self.lazy_y = LazyOptional.of(lambda: self.handler_y)
+    def getCapability(self, cap, side):
+        if cap == kSharedCapId:
+            return self.lazy_y
+        return LazyOptional.empty()
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertFalse(
+            trace.accepted,
+            "A genuine collision must be caught regardless of naming convention"
+        )
+        violation_ids = [v["id"] for v in trace.diagnostic.get("constraint_violations", [])]
+        self.assertIn("MUST_HAVE_UNIQUE_CAPABILITY_KEYS", violation_ids)
+
+    def test_single_hop_alias_resolution(self) -> None:
+        """A key referenced via a same-method local alias (key = MY_CAP; if cap == key) must still resolve correctly."""
+        source = """\
+import net.fabricmc.fabric
+
+class AliasProviderC:
+    def __init__(self):
+        self.handler_c = MyHandlerC()
+        self.lazy_c = LazyOptional.of(lambda: self.handler_c)
+    def getCapability(self, cap, side):
+        key = MY_CAP_C
+        if cap == key:
+            return self.lazy_c
+        return LazyOptional.empty()
+
+class AliasProviderD:
+    def __init__(self):
+        self.handler_d = MyHandlerD()
+        self.lazy_d = LazyOptional.of(lambda: self.handler_d)
+    def getCapability(self, cap, side):
+        key = MY_CAP_D
+        if cap == key:
+            return self.lazy_d
+        return LazyOptional.empty()
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertTrue(
+            trace.accepted,
+            "Distinct keys resolved through a single-hop local alias must not be flagged as a collision"
+        )
+
+
+class TestLexicographicEnergyOrdering(unittest.TestCase):
+    """
+    Tests for EnergyBreakdown.lexicographic_key, which replaced the
+    weighted-scalar comparison as the computational loop's actual
+    accept/revert decision driver.
+
+    The weighted scalar (hard=100, strong=10, soft=1 weights) happens to
+    preserve correct priority dominance today only because the current
+    constraint set is small (max 9 HARD, 2 STRONG) -- it is not
+    structurally guaranteed. These tests construct EnergyBreakdown values
+    directly (not through the full rewrite loop) to prove the
+    lexicographic key orders correctly in a case where it matters, and
+    that it agrees with the scalar in the normal, bounded case.
+    """
+
+    def test_lexicographic_key_correctly_orders_when_quality_swamps_strong_delta(self) -> None:
+        """A single resolved strong violation must outrank ANY quality regression, even one large enough to flip the weighted scalar."""
+        # Before: 1 strong violation, small quality cost.
+        before = EnergyBreakdown(
+            hard_penalty=0.0, strong_penalty=10.0, soft_penalty=0.0,
+            syntax_penalty=0.0, node_delta=1.0,
+        )
+        # After: strong violation resolved, but quality regressed by more
+        # than the strong weight -- enough to flip a weighted-scalar
+        # comparison (10+1=11 -> 0+50=50, scalar says "worse"), but the
+        # strong-tier fix must still dominate lexicographically.
+        after = EnergyBreakdown(
+            hard_penalty=0.0, strong_penalty=0.0, soft_penalty=0.0,
+            syntax_penalty=0.0, node_delta=50.0,
+        )
+        self.assertGreater(
+            after.total, before.total,
+            "Sanity check: this scenario is constructed so the weighted scalar says 'worse'"
+        )
+        self.assertLess(
+            after.lexicographic_key, before.lexicographic_key,
+            "Resolving the strong violation must rank as an improvement lexicographically, "
+            "regardless of how much the weighted scalar disagrees"
+        )
+
+    def test_lexicographic_key_agrees_with_scalar_within_current_bounds(self) -> None:
+        """Within today's actual constraint counts, scalar and lexicographic comparisons must agree (sanity check on current weight separation)."""
+        from tsam.constraint_graph import build_neoforge_constraint_graph
+        cg = build_neoforge_constraint_graph(n_classes=2)
+        max_hard   = len(cg.hard)
+        max_strong = len(cg.strong)
+        # Worst-case quality plausible within one rewrite step in this domain.
+        plausible_quality_ceiling = 10.0
+
+        one_less_hard = EnergyBreakdown(
+            hard_penalty=(max_hard - 1) * 100.0, strong_penalty=max_strong * 10.0,
+            soft_penalty=0.0, syntax_penalty=0.0, node_delta=0.0,
+        )
+        full_hard_zero_quality = EnergyBreakdown(
+            hard_penalty=max_hard * 100.0, strong_penalty=0.0,
+            soft_penalty=0.0, syntax_penalty=0.0, node_delta=0.0,
+        )
+        # One fewer hard violation must beat full strong+quality regardless.
+        self.assertLess(one_less_hard.total, full_hard_zero_quality.total)
+        self.assertLess(one_less_hard.lexicographic_key, full_hard_zero_quality.lexicographic_key)
 
 
 if __name__ == "__main__":

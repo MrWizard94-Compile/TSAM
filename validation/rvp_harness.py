@@ -62,6 +62,7 @@ from tsam.cognitive_state import (
 from tsam.constraint_graph import (
     ProgramGraph,
     build_neoforge_constraint_graph,
+    build_neoforge_constraint_graph_for_source,
 )
 from tsam.rewrite_engine import (
     TSAMComputationalLoop,
@@ -152,6 +153,22 @@ def _energy_is_monotone(energy_trajectory: list[float]) -> tuple[bool, int]:
     return True, -1
 
 
+def _lex_key_is_monotone(lex_trajectory: list[tuple[float, float, float]]) -> tuple[bool, int]:
+    """
+    The actual H3 contract as of the lexicographic-energy change: the
+    computational loop's accept/revert decision is now driven by
+    EnergyBreakdown.lexicographic_key (tuple comparison), not the
+    weighted scalar -- so THIS is what must be verified non-increasing,
+    not the scalar. The scalar is checked separately (still expected to
+    agree given today's bounded constraint counts; a divergence would be
+    a notable, reportable event, not necessarily a contract violation).
+    """
+    for i in range(1, len(lex_trajectory)):
+        if lex_trajectory[i] > lex_trajectory[i - 1]:
+            return False, i
+    return True, -1
+
+
 # ---------------------------------------------------------------------------
 # Per-run result dataclasses
 # ---------------------------------------------------------------------------
@@ -166,9 +183,11 @@ class RunResult:
     accepted:            bool
     output_hash:         str
     energy_trajectory:   list[float]
+    lex_key_trajectory:  list[tuple[float, float, float]]  # the actual decision-driving quantity, see EnergyBreakdown.lexicographic_key
     steps_taken:         int
     hard_fails_final:    int
     strong_fails_final:  int
+    active_hard_constraints: int   # Now genuinely varies with class count, see build_neoforge_constraint_graph
 
     # H1 / H4 — shallow (legacy) measurement
     executive_state_bytes_initial:  int
@@ -182,6 +201,8 @@ class RunResult:
 
     energy_monotone:     bool
     monotone_violation:  int
+    lex_monotone:        bool   # The real contract -- see _lex_key_is_monotone
+    lex_monotone_violation: int
 
     diagnostic:          dict | None
     diagnostic_quality:  float
@@ -233,15 +254,22 @@ class RVPReport:
                 "total_runs":       len(self.run_results),
             },
             "constraint_complexity_note": (
-                "build_neoforge_constraint_graph() returns the same fixed "
-                "6 HARD / 2 STRONG / 2 SOFT constraint graph at every complexity "
-                "level. The n_hard_constraints / n_strong_constraints / "
-                "n_soft_constraints fields on ComplexityProfile (6/6/8/10/12 "
-                "hard across L1-L5 per RVP_specification.md) are declared but "
-                "not wired into the harness. H5 therefore currently validates "
-                "only the structural-complexity axis (classes/methods), not "
-                "the constraint-complexity axis. Treat H5's level-scaling claim "
-                "as scoped to structural complexity only until this is implemented."
+                "RESOLVED (partially, deliberately): build_neoforge_constraint_graph() "
+                "now takes an n_classes parameter and activates cross-class constraints "
+                "(currently MUST_HAVE_UNIQUE_CAPABILITY_KEYS) only when n_classes >= 2, "
+                "via build_neoforge_constraint_graph_for_source(). Active HARD constraint "
+                "count now genuinely varies (8 at L1's n_classes=1, 9 at L2-L5's "
+                "n_classes>=3 -- see active_hard_constraints_by_level in H5 evidence). "
+                "This is intentionally a smaller, more conservative scaling than the "
+                "original 6/6/8/10/12 figures in RVP_specification.md's table, which "
+                "were illustrative placeholders rather than figures derived from actual "
+                "constraints -- adding constraints just to hit pre-set numbers would have "
+                "reintroduced the same kind of unfalsifiable-by-construction problem this "
+                "review has been removing elsewhere. RVP_specification.md's table has been "
+                "updated to match. Further genuinely-justified constraints (STRONG/SOFT "
+                "cross-class consistency checks, additional HARD correctness properties) "
+                "remain a reasonable Stage 1 direction, to be added as they're identified "
+                "rather than invented to fill a quota."
             ),
         }
 
@@ -255,7 +283,13 @@ def _run_one(
     run_index: int,
     budget:    int = 80,
 ) -> RunResult:
-    cg      = build_neoforge_constraint_graph()
+    # Build the constraint graph scaled to this case's actual class count,
+    # not the fixed single-class graph -- otherwise cross-class
+    # constraints (e.g. capability-key uniqueness) would never activate
+    # regardless of how many classes the case actually has, and "active
+    # constraint count" in the report would be measurement theater rather
+    # than something that affects real accept/reject behavior.
+    cg      = build_neoforge_constraint_graph_for_source(case.source)
     mission = Mission.neoforge_port()
 
     tracemalloc.start()
@@ -281,6 +315,10 @@ def _run_one(
         step["verification"]["energy"]
         for step in trace.steps
     ]
+    lex_key_traj = [
+        tuple(step["verification"]["energy_detail"]["lexicographic_key"])
+        for step in trace.steps
+    ]
 
     from tsam.constraint_graph import check_all_constraints
     from tsam.cognitive_state import ConstraintPriority
@@ -295,6 +333,7 @@ def _run_one(
     )
 
     monotone, viol_idx = _energy_is_monotone(energy_traj)
+    lex_monotone, lex_viol_idx = _lex_key_is_monotone(lex_key_traj)
     diag               = trace.diagnostic
     diag_quality       = _diagnostic_quality_score(diag)
 
@@ -306,9 +345,11 @@ def _run_one(
         accepted                       = trace.accepted,
         output_hash                    = _output_hash(final_graph.source),
         energy_trajectory              = energy_traj,
+        lex_key_trajectory             = lex_key_traj,
         steps_taken                    = len(trace.steps),
         hard_fails_final               = hard_fails,
         strong_fails_final             = strong_fails,
+        active_hard_constraints        = len(cg.hard),
         executive_state_bytes_initial  = initial_state_bytes,
         executive_state_bytes_final    = final_state_bytes,
         executive_state_deep_bytes_initial = initial_state_deep_bytes,
@@ -318,6 +359,8 @@ def _run_one(
         peak_tracemalloc_bytes         = peak_bytes,
         energy_monotone                = monotone,
         monotone_violation             = viol_idx,
+        lex_monotone                   = lex_monotone,
+        lex_monotone_violation         = lex_viol_idx,
         diagnostic                     = diag,
         diagnostic_quality             = diag_quality,
         elapsed_ms                     = (t_end - t_start) * 1000,
@@ -420,15 +463,37 @@ def _eval_h2(all_runs: list[RunResult], n_runs_per_case: int) -> HypothesisResul
 
 
 def _eval_h3(all_runs: list[RunResult]) -> HypothesisResult:
-    monotone_violations = [
+    """
+    H3: convergence must be monotone on the quantity that actually drives
+    accept/revert decisions -- EnergyBreakdown.lexicographic_key -- not
+    necessarily the weighted scalar `energy`, which is now reporting-only.
+    The scalar's monotonicity is still checked and reported (it's expected
+    to agree in practice given today's bounded constraint counts; see
+    EnergyBreakdown.lexicographic_key's docstring), but a scalar/lex
+    divergence is recorded as a notable event, not a contract violation,
+    since the lex key is the one Computational Contract C1 actually binds.
+    """
+    lex_monotone_violations = [
         {
             "case_id":           r.case_id,
             "level":             r.level.name,
-            "violation_at_step": r.monotone_violation,
-            "trajectory":        r.energy_trajectory,
+            "violation_at_step": r.lex_monotone_violation,
+            "trajectory":        [list(k) for k in r.lex_key_trajectory],
         }
         for r in all_runs
-        if not r.energy_monotone and len(r.energy_trajectory) > 1
+        if not r.lex_monotone and len(r.lex_key_trajectory) > 1
+    ]
+
+    scalar_divergences = [
+        {
+            "case_id": r.case_id,
+            "level":   r.level.name,
+            "note":    "scalar energy non-monotone while lexicographic key was monotone -- "
+                       "expected to be rare/absent given current constraint-count bounds",
+            "violation_at_step": r.monotone_violation,
+        }
+        for r in all_runs
+        if not r.energy_monotone and r.lex_monotone and len(r.energy_trajectory) > 1
     ]
 
     diag_violations = [
@@ -443,30 +508,35 @@ def _eval_h3(all_runs: list[RunResult]) -> HypothesisResult:
         if not r.accepted and r.diagnostic_quality < 0.8
     ]
 
-    all_violations = monotone_violations + diag_violations
+    all_violations = lex_monotone_violations + diag_violations
     passed = len(all_violations) == 0
 
-    n_checked  = len(all_runs)
-    n_monotone = sum(1 for r in all_runs if r.energy_monotone or len(r.energy_trajectory) <= 1)
-    n_diag_ok  = sum(1 for r in all_runs if r.accepted or r.diagnostic_quality >= 0.8)
+    n_checked     = len(all_runs)
+    n_lex_monotone = sum(1 for r in all_runs if r.lex_monotone or len(r.lex_key_trajectory) <= 1)
+    n_scalar_monotone = sum(1 for r in all_runs if r.energy_monotone or len(r.energy_trajectory) <= 1)
+    n_diag_ok     = sum(1 for r in all_runs if r.accepted or r.diagnostic_quality >= 0.8)
 
     return HypothesisResult(
         hypothesis = "H3: Convergence",
         passed     = passed,
         verdict    = (
-            f"PASS: {n_monotone}/{n_checked} runs monotone; {n_diag_ok}/{n_checked} have clean diagnostics"
+            f"PASS: {n_lex_monotone}/{n_checked} runs lexicographically monotone "
+            f"({n_scalar_monotone}/{n_checked} also scalar-monotone); "
+            f"{n_diag_ok}/{n_checked} have clean diagnostics"
             if passed else
-            f"FAIL: {len(monotone_violations)} monotonicity violations, "
+            f"FAIL: {len(lex_monotone_violations)} lexicographic monotonicity violations, "
             f"{len(diag_violations)} diagnostic quality failures"
         ),
         evidence   = {
-            "runs_checked":       n_checked,
-            "monotone_runs":      n_monotone,
-            "clean_diag_runs":    n_diag_ok,
-            "monotone_violations": len(monotone_violations),
-            "diag_violations":    len(diag_violations),
+            "runs_checked":              n_checked,
+            "lex_monotone_runs":         n_lex_monotone,
+            "scalar_monotone_runs":      n_scalar_monotone,
+            "scalar_lex_divergences":    len(scalar_divergences),
+            "clean_diag_runs":           n_diag_ok,
+            "lex_monotone_violations":   len(lex_monotone_violations),
+            "diag_violations":           len(diag_violations),
         },
-        violations = all_violations[:20],
+        violations = (all_violations + scalar_divergences)[:20],
     )
 
 
@@ -611,9 +681,11 @@ def _eval_h5(all_runs: list[RunResult]) -> HypothesisResult:
     passed = len(violations) == 0
 
     accept_by_level: dict[str, str] = {}
+    active_constraints_by_level: dict[str, int] = {}
     for level_name, runs in solvable_by_level.items():
         n_acc = sum(1 for r in runs if r.accepted)
         accept_by_level[level_name] = f"{n_acc}/{len(runs)}"
+        active_constraints_by_level[level_name] = runs[0].active_hard_constraints if runs else 0
 
     avg_diag_quality = (
         sum(r.diagnostic_quality for r in rejected_runs) / len(rejected_runs)
@@ -634,6 +706,7 @@ def _eval_h5(all_runs: list[RunResult]) -> HypothesisResult:
                 k: round(v, 4) for k, v in sat_rate_by_level.items()
             },
             "acceptance_solvable_by_level": accept_by_level,
+            "active_hard_constraints_by_level": active_constraints_by_level,
             "rejected_cases":             len(rejected_runs),
             "avg_diagnostic_quality":     round(avg_diag_quality, 4),
             "diag_quality_failures":      len(diag_failures),

@@ -48,6 +48,8 @@ from tsam.constraint_graph import (
     check_all_constraints,
     CAPABILITY_METHOD_NAMES,
     class_shows_capability_provider_evidence,
+    _collect_subtree_refs,
+    class_capability_keys,
 )
 from tsam.task_planner import Task, TaskKind, TaskPlan, TaskPlanner, TaskStatus
 
@@ -106,11 +108,36 @@ class EnergyBreakdown:
     def total(self) -> float:
         return self.gating + self.quality
 
+    @property
+    def lexicographic_key(self) -> tuple[float, float, float]:
+        """
+        Truly priority-ordered comparison key: (hard+syntax tier, strong
+        tier, quality tier). Python tuple comparison is lexicographic by
+        construction, so a single additional hard/syntax violation always
+        outranks ANY amount of strong/quality change, and a single
+        additional strong violation always outranks any amount of quality
+        change -- regardless of constraint count or weight values.
+
+        Distinct from .total (the weighted scalar used for human-readable
+        reporting and JSON serialization, kept unchanged for backward
+        compatibility). The scalar's dominance is currently correct too,
+        but only because the weights (100/10/1) happen to be separated
+        enough given today's bounded constraint counts (max 9 HARD,
+        2 STRONG) -- an incidental property of the current constraint set,
+        not a structural guarantee. Definition 5's own note that "future
+        extensions are expected to treat energy as partially ordered" is
+        exactly this distinction. This property is the actual decision
+        driver in the computational loop's progress check; .total remains
+        the reported number.
+        """
+        return (self.hard_penalty + self.syntax_penalty, self.strong_penalty, self.quality)
+
     def to_dict(self) -> dict:
         return {
             "total":          round(self.total, 4),
             "gating":         round(self.gating, 4),
             "quality":        round(self.quality, 4),
+            "lexicographic_key": [round(v, 4) for v in self.lexicographic_key],
             "hard_penalty":   round(self.hard_penalty, 4),
             "strong_penalty": round(self.strong_penalty, 4),
             "soft_penalty":   round(self.soft_penalty, 4),
@@ -299,18 +326,12 @@ def _rewrite_source_add_method(source: str, method_name: str) -> str:
     except SyntaxError:
         return source
 
-    template_map = {
-        "getCapability":          NEOFORGE_GET_CAPABILITY_TEMPLATE,
-        "invalidateCapabilities": NEOFORGE_INVALIDATE_TEMPLATE,
-        "register_capability":    NEOFORGE_REGISTER_CAPABILITY_TEMPLATE,
-    }
-    template = template_map.get(method_name, f"    def {method_name}(self):\n        pass\n")
-    indented = textwrap.indent(template.strip(), "    ")
-
     class_defs = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
 
     if not class_defs:
         # No class found — module-level fallback, single global check is fine here.
+        template = _TEMPLATE_MAP.get(method_name, f"    def {method_name}(self):\n        pass\n")
+        indented = textwrap.indent(template.strip(), "    ")
         if method_name in source:
             return source
         return source.rstrip("\n") + "\n\n" + indented + "\n"
@@ -339,29 +360,125 @@ def _rewrite_source_add_method(source: str, method_name: str) -> str:
 
     lines = source.splitlines(keepends=True)
     for cdef in sorted(targets, key=lambda c: (c.end_lineno or c.lineno), reverse=True):
+        body      = _render_method_body(method_name, cdef)
+        indented  = textwrap.indent(body.strip(), "    ")
         insert_at = cdef.end_lineno or cdef.lineno
         lines.insert(insert_at, "\n" + indented + "\n")
 
     return "".join(lines)
 
 
+_TEMPLATE_MAP = {
+    "getCapability":          NEOFORGE_GET_CAPABILITY_TEMPLATE,
+    "invalidateCapabilities": NEOFORGE_INVALIDATE_TEMPLATE,
+    "register_capability":    NEOFORGE_REGISTER_CAPABILITY_TEMPLATE,
+}
+
+
+def _capability_key_for_class(cdef: ast.ClassDef) -> str:
+    """
+    Pick a capability-key identifier to use when synthesizing a stub
+    method body for THIS class: reuse whichever capability-key identifier
+    the class already uses (so a freshly-added register_capability stays
+    consistent with that class's own existing getCapability key), falling
+    back to a name derived from the class's own name if none is found.
+
+    This is the fix for a bug "try to break it" stress-testing surfaced:
+    the templates below originally used a single fixed literal
+    "MY_CAPABILITY" placeholder. When a stub had to be synthesized fresh
+    for more than one class in the same file, every one of them got the
+    *same* placeholder — a genuine collision, correctly caught by
+    MUST_HAVE_UNIQUE_CAPABILITY_KEYS once that constraint existed, but
+    with no way to repair it (renaming a collision requires intent Stage 0
+    doesn't have). The real fix is to never generate the collision in the
+    first place.
+
+    Uses class_capability_keys() (structural role detection, not naming
+    convention) so this stays consistent with what the constraint check
+    itself considers the class's key to be -- using two different
+    detectors here and in unique_capability_keys would silently reopen
+    the same class of bug under a different name.
+    """
+    existing = class_capability_keys(cdef)
+    if existing:
+        return sorted(existing)[0]
+    return f"MY_CAPABILITY_{cdef.name.upper()}"
+
+
+def _render_method_body(method_name: str, cdef: ast.ClassDef) -> str:
+    """Render the stub body for `method_name`, substituting a per-class capability key where needed."""
+    if method_name == "invalidateCapabilities":
+        return NEOFORGE_INVALIDATE_TEMPLATE
+    if method_name in ("getCapability", "register_capability"):
+        key = _capability_key_for_class(cdef)
+        return _TEMPLATE_MAP[method_name].replace("MY_CAPABILITY", key)
+    return _TEMPLATE_MAP.get(method_name, f"    def {method_name}(self):\n        pass\n")
+
+
 def _rewrite_source_adapt_capability_body(source: str) -> str:
     """
     Rewrite the getCapability method body to use NeoForge API patterns.
-    If method not found, injects it.
+
+    Note: this is currently a narrow, rarely-triggered heuristic. Given
+    MUST_PRESERVE_BEHAVIOR's check is purely structural ("does this method
+    exist"), this task is only ever scheduled when getCapability is
+    entirely absent -- in which case MUST_HAVE_CAPABILITY_METHOD (HARD,
+    runs first) already adds a correct stub from scratch, making this
+    task a no-op by the time it runs. Genuine behavioral adaptation (e.g.
+    detecting and rewriting Fabric-specific logic *within* an existing
+    getCapability body) needs deeper structural/dataflow analysis than
+    Stage 0 does -- that's Stage 1 scope, not a Stage 0 patch. An earlier
+    version of this function had a literal identity replacement
+    ("LazyOptional.of(lambda:" -> the same string) that did nothing;
+    removed as dead code rather than left looking like real coverage.
     """
-    # Find and replace old capability return pattern
-    # Stage 0: simple string-based transformation
     replacements = [
-        # Fabric LazyOptional.of(...) → NeoForge LazyOptional.of(...)
-        ("LazyOptional.of(lambda:", "LazyOptional.of(lambda:"),
-        # Fabric get capability return
         ("return super().getCapability(cap, side)", "return LazyOptional.empty()"),
     ]
     result = source
     for old, new in replacements:
         result = result.replace(old, new)
     return result
+
+
+def _rewrite_source_remove_dangling_fabric_statements(source: str) -> str:
+    """
+    Within classes that show capability-provider evidence, remove any
+    individual statement that still references a forbidden Fabric API.
+
+    Complements _rewrite_source_remove_forbidden_apis, which only strips
+    whole import lines: a genuine capability provider can incidentally
+    also contain a leftover Fabric call inside e.g. __init__ (a class that
+    is both a capability provider AND, incidentally, a Fabric event
+    registrant) -- that needs removing at the statement level, not the
+    import level. Classes with NO capability evidence are left alone here;
+    those are MUST_MATCH_KNOWN_PATTERN's job (reject, don't patch).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    remove_linenos: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not class_shows_capability_provider_evidence(node):
+            continue
+        for stmt in ast.walk(node):
+            if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign)):
+                stmt_refs = _collect_subtree_refs(stmt)
+                if any(forbidden in ref for ref in stmt_refs for forbidden in FABRIC_APIS):
+                    start = stmt.lineno
+                    end   = stmt.end_lineno or start
+                    remove_linenos.update(range(start, end + 1))
+
+    if not remove_linenos:
+        return source
+
+    lines  = source.splitlines(keepends=True)
+    result = [line for i, line in enumerate(lines, start=1) if i not in remove_linenos]
+    return "".join(result)
 
 
 def _rewrite_source_register_capability(source: str) -> str:
@@ -424,6 +541,10 @@ class DeterministicRuleStabilizer:
             case TaskKind.REGISTER_CAPABILITY:
                 new_source  = _rewrite_source_register_capability(source)
                 description = "Added capability registration via BlockCapabilityRegistrar"
+
+            case TaskKind.CLEAN_DANGLING_FABRIC_REFS:
+                new_source  = _rewrite_source_remove_dangling_fabric_statements(source)
+                description = "Removed leftover Fabric API call(s) from capability-provider class body"
 
             case TaskKind.APPLY_NAMING_CONVENTION:
                 # Soft optimization: Stage 0 is a no-op (naming preserved)
@@ -679,6 +800,7 @@ class TSAMComputationalLoop:
 
         # ── MAIN LOOP: Transform → Stabilize → Verify → Decide ───────────
         prev_energy = initial_report.energy
+        prev_key    = initial_report.breakdown.lexicographic_key
 
         while state.can_continue:
             step += 1
@@ -732,12 +854,16 @@ class TSAMComputationalLoop:
                 new_graph, cg, step, rewrite_desc, original_graph
             )
 
-            # Computational Contract C1: Check progress
-            energy_reduced = report.energy < prev_energy
-            if not energy_reduced and report.energy > prev_energy + 0.001:
-                # Energy increased — rewrite made things worse; reject this rewrite
+            new_key = report.breakdown.lexicographic_key
+            if new_key > prev_key:
+                # Computational Contract C1: a step that regresses the
+                # priority-ordered key (a hard/strong violation got worse,
+                # or quality regressed with hard/strong unchanged) is
+                # rejected, regardless of what the weighted scalar energy
+                # says -- this is the actual progress check now; the
+                # scalar (still printed below) is reporting only.
                 if verbose:
-                    print(f"         ✗ Energy increased ({prev_energy:.2f} → {report.energy:.2f}), reverting")
+                    print(f"         Lexicographic key regressed ({prev_key} -> {new_key}), reverting")
                 plan.mark(task.task_id, TaskStatus.FAILED)
                 # Keep old graph, advance state minimally
                 state = state.advance(
@@ -750,6 +876,7 @@ class TSAMComputationalLoop:
             # Accept the rewrite
             graph       = new_graph
             prev_energy = report.energy
+            prev_key    = new_key
             plan.mark(task.task_id, TaskStatus.COMPLETED)
 
             state = state.advance(

@@ -50,6 +50,7 @@ class TaskKind(Enum):
     # High-priority tasks (from STRONG constraints)
     ADAPT_CAPABILITY_BODY     = auto()  # Rewrite method body for NeoForge API
     REGISTER_CAPABILITY       = auto()  # Add capability registration call
+    CLEAN_DANGLING_FABRIC_REFS = auto()  # Remove leftover Fabric calls from capability-provider class bodies
 
     # Optimization tasks (from SOFT constraints)
     MINIMIZE_DIFF             = auto()  # Minimize AST node changes
@@ -305,6 +306,24 @@ class TaskPlanner:
                     params            = (constraint.check_param,),
                     depends_on        = (f"task_MUST_USE_NEOFORGE_APIS",),
                 )
+
+            case "no_forbidden_refs_in_evidence_class_body":
+                return Task(
+                    task_id           = f"task_{constraint.constraint_id}",
+                    kind              = TaskKind.CLEAN_DANGLING_FABRIC_REFS,
+                    priority          = constraint.priority,
+                    source_constraint = constraint.constraint_id,
+                    description       = "Remove leftover Fabric API call(s) from capability-provider class body",
+                    params            = (),
+                    depends_on        = (),
+                )
+
+            # Note: "unique_capability_keys" has no case here, deliberately.
+            # Renaming a colliding capability-key constant requires intent
+            # Stage 0 doesn't have access to -- guessing a new name would be
+            # exactly the kind of fabrication this architecture exists to
+            # avoid. It falls through to `case _` below and is reported via
+            # diagnostic rather than auto-repaired.
 
             case _:
                 return None
