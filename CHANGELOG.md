@@ -16,6 +16,84 @@ and the RVP harness before being applied — see "Verification" per entry.
 
 ---
 
+## [0.7.0] — 2026-06-28 — Stage 1 groundwork: multi-module program representation
+
+First slice of Stage 1 (cross-module dependency tracking). It adds the
+persistent multi-module representation P_t that Stage 1's bounded active
+window, demand-driven resolver, and Cross-module Consistency penalty C will
+operate over in subsequent slices. This is **groundwork, not a Stage
+transition**: no Stage 1 entry criteria are claimed met (that would be a
+MAJOR bump per the versioning note above), and Stage 0 behaviour is
+untouched — the full RVP is numerically unchanged.
+
+### Added
+- `src/tsam/module_graph.py`:
+  - `ModuleDescriptor` (Stage 1 Spec §1.2): id, canonical path, exports,
+    imports, capability_evidence, parse/truncation status, last_accessed.
+    Immutable; reuses the Stage 0 capability-provider heuristic
+    (`class_shows_capability_provider_evidence`) unchanged.
+  - `ModuleGraph`: the persistent P_t — every module's descriptor (the
+    bounded view) plus its parsed `ProgramGraph` (the artifact), kept in
+    separate maps, with the resolved cross-module import/export structure.
+    Two-pass build (assign ids → resolve import targets by exact
+    canonical-path match).
+  - Static extraction: `__all__`-aware export detection with re-export
+    provenance (origin module recorded, for the future transitive resolver),
+    module-level import extraction (from / plain / star / relative), and
+    internal-vs-external resolution.
+  - Derived cross-module signals, all deterministic and sorted:
+    `cross_module_imports`, `dangling_internal_imports` (the cross-module
+    unresolved-reference signal that will feed the C penalty),
+    `capability_key_index` / `colliding_capability_keys` (the cross-module
+    registration-collision signal), `importers_of`, and `structural_hash`.
+- `validation/module_generators.py`: heterogeneous multi-module fixtures
+  (core / Fabric provider / already-ported NeoForge provider / plain utility
+  / registry archetypes), with solvable and unsolvable project generators
+  carrying declared expected structure. Directly attacks the standing
+  homogeneity limitation of the single-file benchmark (one pattern × N
+  copies) by mixing archetypes and real cross-module references in one
+  project.
+- `tests/test_stage1_modules.py` (34 tests): identity/canonicalisation,
+  export/import extraction (incl. `__all__`, re-export provenance, alias and
+  star handling), capability evidence, clean rejection (unparseable module
+  flagged not silently empty; ambiguous project rejected; export/import caps
+  flagged), determinism (stable hash across builds, input-order-independent,
+  excludes window state), bounded descriptor (size independent of source
+  length), cross-module structure (dangling, collisions, importers), and the
+  fixtures' declared expected structure.
+
+### Design notes / deviations
+- **`last_accessed` is a logical tick, not a wall-clock timestamp.** The
+  Stage 1 spec (§1.2) names it a "timestamp," but a wall-clock value would
+  violate the Determinism invariant. Implemented as an integer access
+  counter the (future) working-set manager advances via
+  `ModuleDescriptor.touched`, which refuses to move backwards. LRU ordering
+  is therefore a pure function of the deterministic admission sequence.
+- **Caps are hard, flagged, and conservative.** `MAX_EXPORTS_PER_MODULE` /
+  `MAX_IMPORTS_PER_MODULE` (256) bound descriptor size (Invariant 5.1);
+  truncation sets an explicit `*_truncated` flag so downstream resolution
+  can treat the module conservatively rather than mis-resolve silently
+  (Clean Rejection).
+- **Separation of concerns:** the bounded descriptor and the heavy parsed
+  `ProgramGraph` live in separate maps; `last_accessed` is excluded from the
+  structural hash (window state, not artifact identity).
+
+### Not in this slice (subsequent Stage 1 work)
+The bounded Active Window W_t and its LRU eviction; multi-hop / transitive
+import resolution (re-export chains, hop_count ≤ 3); the Cross-module
+Consistency penalty C and the `(H, S, C, Q)` energy tuple; any change to
+acceptance behaviour. This slice provides the representation those consume.
+
+### Verification
+94/94 unit tests pass (60 prior + 34 new). The module-layer
+`structural_hash` is identical across three `PYTHONHASHSEED` values
+(determinism holds under hash randomisation). Full RVP: all 5 hypotheses
+pass, numerically unchanged from 0.6.0 (the new files are not on the
+harness's path). Reproduce with `python -m unittest discover -s tests` and
+`python validation/rvp_harness.py`.
+
+---
+
 ## [0.6.0] — 2026-06-27 — Dangling-reference safety in the rewrite engine's own removal logic
 
 ### Fixed
