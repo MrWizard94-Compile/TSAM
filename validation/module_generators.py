@@ -35,6 +35,7 @@ __all__ = [
     "broken_module_source",
     "generate_solvable_project",
     "generate_unsolvable_project",
+    "generate_reexport_chain_project",
     "generate_projects",
 ]
 
@@ -305,6 +306,36 @@ def generate_unsolvable_project(case_index: int = 0) -> MultiModuleCase:
         expected_key_collisions     = 1,   # the shared key, declared by 2 providers
         expected_edges              = expected_edges,
     )
+
+
+def generate_reexport_chain_project(depth: int, case_index: int = 0) -> dict[str, str]:
+    """
+    A linear re-export chain for exercising the multi-hop resolver.
+
+    Builds ``depth + 1`` modules: ``m0`` locally defines and exports ``KEY``;
+    each ``m{i}`` for ``1 <= i <= depth`` re-exports ``KEY`` from ``m{i-1}``;
+    and a ``consumer`` module imports ``KEY`` from ``m{depth}`` (the top of the
+    chain). Resolving the consumer's import therefore traverses ``depth + 1``
+    modules: ``depth = 0`` resolves in one hop, ``depth = 2`` in three, and
+    ``depth = 3`` requires a fourth hop and must terminate at the ceiling.
+
+    Returns a ``path -> source`` mapping (not a ``MultiModuleCase`` — these are
+    resolver micro-fixtures, not full project cases).
+    """
+    if depth < 0:
+        raise ValueError("depth must be >= 0")
+
+    prefix = f"chain{case_index}"
+    key = f"CHAIN_KEY_{case_index}"
+    modules: dict[str, str] = {
+        f"{prefix}.m0": f"{key} = object()\n__all__ = [{key!r}]\n",
+    }
+    for i in range(1, depth + 1):
+        modules[f"{prefix}.m{i}"] = (
+            f"from {prefix}.m{i - 1} import {key}\n__all__ = [{key!r}]\n"
+        )
+    modules[f"{prefix}.consumer"] = f"from {prefix}.m{depth} import {key}\n"
+    return modules
 
 
 def generate_projects(

@@ -16,6 +16,82 @@ and the RVP harness before being applied — see "Verification" per entry.
 
 ---
 
+## [0.8.0] — 2026-06-28 — Stage 1: bounded active window W_t + multi-hop resolver
+
+Second slice of Stage 1. It adds the *transient* executive view over the
+persistent P_t from 0.7.0: a demand-driven, single-pass multi-hop resolver
+that follows re-export chains to a symbol's declaring module, and the bounded
+Active Window W_t the planner/rewriter/verifier will operate over. Still
+**not a Stage transition**: no acceptance behaviour changes, W_t is not yet
+wired into `CognitiveState` or the rewrite loop, and the full RVP is
+numerically unchanged.
+
+### Added
+- `src/tsam/active_window.py`:
+  - `resolve_symbol(...)` (Spec §1.3): a pure, single-pass resolver over the
+    persistent `ModuleGraph`. Follows re-export chains, returning one of
+    `RESOLVED` / `UNRESOLVED_DANGLING` / `UNRESOLVED_EXTERNAL` /
+    `UNRESOLVED_HOP_LIMIT` / `UNRESOLVED_CYCLE`, with the declaring module,
+    hop count, and the visited chain for diagnostics. Modules examined per
+    import are bounded by `MAX_HOPS`, independent of project size.
+  - `ActiveWindow` (Spec §1.4, §2): the bounded working set W_t. Three hard
+    caps — `MAX_ACTIVE_MODULES` (32), `MAX_ACTIVE_EDGES` (128),
+    `MAX_RESOLVED_KEYS` (64) — enforced by deterministic LRU eviction on a
+    logical clock. Demand-driven admission (a module enters with its direct
+    in-project dependencies), focus + last-4-verification-record eviction
+    protection (`VERIFICATION_PROTECTION_DEPTH`), and re-resolution after
+    eviction. Surfaces `CrossModuleEdge`s (including unresolved ones, as
+    first-class diagnosable objects) and `ResolvedCapabilityKey`s, with
+    `colliding_resolved_keys()` reporting cross-module registration
+    collisions — the precise signals the C penalty will score in slice 3.
+- `validation/module_generators.py`: `generate_reexport_chain_project(depth)`,
+  a linear re-export chain fixture for exercising resolution at hops 1–3 and
+  termination beyond the ceiling.
+- `tests/test_stage1_window.py` (22 tests): resolver (direct / 1-hop / at the
+  ceiling / beyond-ceiling termination / dangling / external re-export /
+  cycle / bounded exploration), window resolution (focus admission,
+  cross-module key-collision detection, dangling import recorded as
+  unresolved, star/external imports), bounded state (all three caps never
+  exceeded under load + LRU correctness + focus/verification protection +
+  protection aging out + eviction-drops-edges + re-resolution recovery), and
+  determinism (identical content hash for an identical drive sequence; hash
+  excludes logical ticks; `within_bounds` holds throughout).
+
+### Design notes / deviations
+- **Hop-limit boundary (Spec §1.3 is ambiguous).** The spec says both
+  "follow the chain only if hop_count < 3" and "any chain reaching
+  hop_count == 3 is terminated." This implementation takes the first as
+  governing: resolution succeeds at `hop_count` up to and including
+  `MAX_HOPS` (3), and a re-export that would need a *fourth* module
+  terminates as `HOP_LIMIT`. The boundary is the single `hop >= max_hops`
+  check in `resolve_symbol` and the `MAX_HOPS` constant — flip to
+  `hop + 1 >= max_hops` (or lower `MAX_HOPS`) if "resolution may only succeed
+  at hops 1–2" was intended. Flagged, not silently chosen.
+- **LRU is a logical clock, not wall-clock** (continues the 0.7.0
+  `last_accessed` decision), so eviction order is a pure function of the
+  admission/resolution sequence (Determinism).
+- **Hard caps win over protection in the pathological case:** if the
+  protected set alone exceeded a cap, the window would evict LRU among
+  protected rather than breach the cap. Caps (32) are sized well above any
+  realistic focus + 4 verification records, so this is a guard, not an
+  expected path.
+
+### Not in this slice (slice 3)
+The Cross-module Consistency penalty C and the `(H, S, C, Q)` energy tuple;
+wiring W_t into `CognitiveState` (S_t) and the rewrite loop (deriving focus
+from `Focus` and verification protection from `V_t`); charging re-resolution
+to the planner's iteration budget. This is the first slice that will change
+acceptance behaviour — this one does not.
+
+### Verification
+116/116 unit tests pass (94 prior + 22 new). The window's
+`structural_state_hash` is identical across three `PYTHONHASHSEED` values.
+Full RVP: all 5 hypotheses pass, numerically unchanged from 0.7.0 (the new
+files are not on the harness's path). Reproduce with
+`python -m unittest discover -s tests` and `python validation/rvp_harness.py`.
+
+---
+
 ## [0.7.0] — 2026-06-28 — Stage 1 groundwork: multi-module program representation
 
 First slice of Stage 1 (cross-module dependency tracking). It adds the
