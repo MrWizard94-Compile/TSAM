@@ -59,7 +59,7 @@
     "H4_resource": {
       "hypothesis": "H4: Resource Profile",
       "passed": true,
-      "verdict": "PASS: Executive state flat across L1-L5 at fixed solvability ({'solvable': 0, 'unsolvable': 0}); total memory growth ratio = 14.9\u00d7",
+      "verdict": "PASS: Executive state flat across L1-L5 at fixed solvability ({'solvable': 0, 'unsolvable': 0}); total memory growth ratio = 14.1\u00d7",
       "evidence": {
         "executive_delta_bytes_by_solvability": {
           "solvable": 0,
@@ -67,13 +67,13 @@
         },
         "executive_flat": true,
         "avg_peak_kb_by_level": {
-          "L1": 82.4,
-          "L2": 180.6,
-          "L3": 300.5,
-          "L4": 605.2,
-          "L5": 1218.3
+          "L1": 88.3,
+          "L2": 188.3,
+          "L3": 307.8,
+          "L4": 617.4,
+          "L5": 1242.2
         },
-        "growth_ratio_L1_to_L5": 14.88,
+        "growth_ratio_L1_to_L5": 14.07,
         "growth_limit": 30.0
       },
       "violations": []
@@ -117,5 +117,5 @@
     "total_runs": 150
   },
   "constraint_complexity_note": "RESOLVED (partially, deliberately): build_neoforge_constraint_graph() now takes an n_classes parameter and activates cross-class constraints (currently MUST_HAVE_UNIQUE_CAPABILITY_KEYS) only when n_classes >= 2, via build_neoforge_constraint_graph_for_source(). Active HARD constraint count now genuinely varies (8 at L1's n_classes=1, 9 at L2-L5's n_classes>=3 -- see active_hard_constraints_by_level in H5 evidence). This is intentionally a smaller, more conservative scaling than the original 6/6/8/10/12 figures in RVP_specification.md's table, which were illustrative placeholders rather than figures derived from actual constraints -- adding constraints just to hit pre-set numbers would have reintroduced the same kind of unfalsifiable-by-construction problem this review has been removing elsewhere. RVP_specification.md's table has been updated to match. Further genuinely-justified constraints (STRONG/SOFT cross-class consistency checks, additional HARD correctness properties) remain a reasonable Stage 1 direction, to be added as they're identified rather than invented to fill a quota.",
-  "provenance_note": "Computed in a verified sandbox replica of this codebase after the Phase A/B/D fixes, the gap-closure pass, the Stage 1 structural capability-key detector, and the lexicographic-energy change (EnergyBreakdown.lexicographic_key now drives the loop's accept/revert decision; H3 verifies monotonicity on this quantity, reporting scalar agreement separately -- see the H3_convergence evidence above). Run `python validation/rvp_harness.py` yourself to reproduce/confirm; it should match exactly, per H2's determinism guarantee."
+  "provenance_note": "Computed in a verified sandbox replica of this codebase after the Phase A/B/D fixes, the gap-closure pass, the Stage 1 structural capability-key detector, the lexicographic-energy change, and the v0.6.0 dangling-reference safety fix (the rewrite engine's own forbidden-API/statement removal could delete a binding still referenced elsewhere, producing code that parses but breaks at runtime -- both _rewrite_source_remove_forbidden_apis and _rewrite_source_remove_dangling_fabric_statements now refuse such removals; MUST_NOT_USE_FABRIC_APIS also switched from exact-match to substring-match against api_inventory(), since a from-import's fully-qualified target never exactly equals a FABRIC_APIS entry). None of these existing benchmark cases exercise that specific failure mode, so results are numerically unchanged; the fix is covered by 5 new dedicated regression tests instead. Run `python validation/rvp_harness.py` yourself to reproduce/confirm; it should match exactly, per H2's determinism guarantee."
 }

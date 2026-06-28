@@ -859,7 +859,22 @@ def check_constraint(
         case "forbidden_api_set":
             forbidden = set(json.loads(c.check_param))
             actual    = graph.api_inventory()
-            violations = actual.intersection(forbidden)
+            # Substring match, not exact set-intersection: api_inventory()
+            # stores fully-qualified import targets (e.g.
+            # "net.fabricmc.FabricHelperAlias" for `from net.fabricmc
+            # import FabricHelperAlias`), which never exactly equals a
+            # FABRIC_APIS entry like "net.fabricmc" even though it's
+            # obviously the same forbidden module. Exact intersection let
+            # such imports silently evade this constraint entirely (caught
+            # via adversarial testing of the dangling-reference guard in
+            # the rewrite engine -- before that guard existed, the rewrite
+            # engine's own broader substring-based removal logic happened
+            # to clean these up as a side effect, masking the gap). Every
+            # other forbidden-API check in this file (fabric_entanglement_
+            # requires_evidence, no_forbidden_refs_in_evidence_class_body)
+            # already uses substring matching; this brings the import-level
+            # check in line with them.
+            violations = {a for a in actual if any(f in a for f in forbidden)}
             ok         = len(violations) == 0
             msg        = f"Forbidden APIs found: {sorted(violations)}" if not ok else ""
             return ConstraintResult(c.constraint_id, c.priority, ok, msg)

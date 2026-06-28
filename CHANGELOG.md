@@ -16,6 +16,63 @@ and the RVP harness before being applied — see "Verification" per entry.
 
 ---
 
+## [0.6.0] — 2026-06-27 — Dangling-reference safety in the rewrite engine's own removal logic
+
+### Fixed
+**Severe**: two independent paths in the rewrite engine could delete a
+binding without checking whether anything else in the file still
+referenced it, producing code that parses (passes `MUST_COMPILE`) but
+raises at runtime -- and the system was **accepting** that as valid
+output. This is exactly the "fabricate broken output instead of
+rejecting" failure mode the architecture exists to prevent, found via
+adversarial testing of the 0.3.0 dangling-cleanup machinery, this time
+in code built earlier in this same review rather than the original
+baseline:
+- `_rewrite_source_remove_dangling_fabric_statements` would delete e.g.
+  `self.fabric_thing = net.fabricmc.fabric.SomeHelper.create()` even
+  though `self.fabric_thing` was read later in the same class
+  (`getCapability`'s body), leaving an `AttributeError` waiting to happen.
+- `_rewrite_source_remove_forbidden_apis` would delete e.g.
+  `from net.fabricmc import FabricHelperAlias` even though
+  `FabricHelperAlias.get()` was called elsewhere in the file, leaving a
+  `NameError` waiting to happen.
+
+Fixed by `_names_bound_by_statement` / `_is_binding_referenced_elsewhere`
+(new, shared): before removing an import or a statement, check whether
+its binding is referenced anywhere else in the relevant scope (the whole
+file for imports, the class for statements). If so, refuse to remove it
+-- the corresponding constraint stays violated and the system correctly
+rejects with a diagnostic, rather than silently producing broken output.
+Deterministic, conservative, no attempt to also rewrite the downstream
+usage site (that would require understanding intent, which Stage 0
+deliberately doesn't attempt).
+
+**Related, independently discovered while debugging the above**:
+`MUST_NOT_USE_FABRIC_APIS` (`forbidden_api_set` check) used exact
+set-intersection against `api_inventory()`'s fully-qualified import
+targets (e.g. `"net.fabricmc.FabricHelperAlias"`), which never exactly
+equals a `FABRIC_APIS` entry like `"net.fabricmc"` even though it's
+obviously the same forbidden module. This let `from net.fabricmc import
+X` evade the constraint entirely -- previously masked because the
+rewrite engine's own broader substring-based removal cleaned such
+imports up as a side effect, until the new dangling-reference guard
+started legitimately blocking some of those removals and exposed the
+gap underneath. Switched to substring matching, consistent with every
+other forbidden-API check in the file.
+
+### Added
+- `TestDanglingReferenceSafety` (5 tests): both confirmed bugs, two
+  sanity checks that legitimately-safe removals are still performed (the
+  guard isn't overly conservative), and one test that the substring-match
+  fix catches a `from`-import variant directly.
+
+### Verification
+60/60 unit tests pass. Full RVP: all 5 hypotheses pass, numerically
+unchanged from 0.5.0 (no existing benchmark case exercises this failure
+mode -- entirely new adversarial test cases were needed to find it).
+
+---
+
 ## [0.5.0] — 2026-06-27 — Lexicographic energy ordering; documentation infrastructure
 
 ### Changed

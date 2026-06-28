@@ -1044,5 +1044,163 @@ class TestLexicographicEnergyOrdering(unittest.TestCase):
         self.assertLess(one_less_hard.lexicographic_key, full_hard_zero_quality.lexicographic_key)
 
 
+class TestDanglingReferenceSafety(unittest.TestCase):
+    """
+    Regression tests for a severe bug found by adversarial testing of the
+    0.3.0 dangling-fabric-cleanup machinery: both
+    _rewrite_source_remove_dangling_fabric_statements (statement removal)
+    and _rewrite_source_remove_forbidden_apis (import removal) would
+    delete a binding without checking whether something else in the file
+    still referenced it -- producing code that parses (passes
+    MUST_COMPILE) but raises at runtime (AttributeError / NameError), and
+    *accepting* that as valid output. This is exactly the "fabricate
+    broken output instead of rejecting" failure mode the architecture
+    exists to prevent, and it was happening via the architecture's own
+    repair logic.
+
+    Also covers a related, independently-discovered bug:
+    MUST_NOT_USE_FABRIC_APIS used exact set-intersection against fully-
+    qualified import targets, so `from net.fabricmc import X` never
+    exactly matched the FABRIC_APIS entry "net.fabricmc" and silently
+    evaded the constraint entirely (previously masked because the
+    rewrite engine's broader substring-based removal cleaned it up as a
+    side effect, until the dangling-reference guard above started
+    legitimately blocking some of those removals).
+    """
+
+    def setUp(self) -> None:
+        self.mission = Mission.neoforge_port()
+        self.loop    = TSAMComputationalLoop()
+
+    def _run(self, source: str, budget: int = 30):
+        from tsam.constraint_graph import build_neoforge_constraint_graph_for_source
+        cg = build_neoforge_constraint_graph_for_source(source)
+        state = CognitiveState.initialize(self.mission, max_rewrites=budget)
+        return self.loop.run(source, state, cg, verbose=False)
+
+    def test_removing_assignment_used_elsewhere_is_refused(self) -> None:
+        """A forbidden-API assignment whose target is used elsewhere in the class must not be silently removed and accepted."""
+        source = """\
+import net.fabricmc.fabric
+
+class RiskyProvider:
+    def __init__(self):
+        self.handler = MyHandler()
+        self.lazy = LazyOptional.of(lambda: self.handler)
+        self.fabric_thing = net.fabricmc.fabric.SomeHelper.create()
+
+    def getCapability(self, cap, side):
+        if cap == MY_CAP:
+            combined = self.lazy.combine(self.fabric_thing)
+            return combined
+        return LazyOptional.empty()
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertFalse(
+            trace.accepted,
+            "Must not accept output where a removed assignment's target is still referenced"
+        )
+        # And the output must not actually contain the dangling reference
+        # while ALSO lacking the assignment (i.e. don't half-apply this).
+        if "self.fabric_thing = " not in final_graph.source:
+            self.assertNotIn(
+                "self.fabric_thing", final_graph.source,
+                "If the assignment was removed, nothing should still reference its target"
+            )
+
+    def test_removing_import_alias_used_elsewhere_is_refused(self) -> None:
+        """A forbidden import whose bound alias is used elsewhere must not be silently removed and accepted."""
+        source = """\
+import net.fabricmc.fabric
+from net.fabricmc import FabricHelperAlias
+
+class AliasRiskyProvider:
+    def __init__(self):
+        self.handler = MyHandler()
+        self.lazy = LazyOptional.of(lambda: self.handler)
+
+    def getCapability(self, cap, side):
+        if cap == MY_CAP:
+            helper = FabricHelperAlias.get()
+            return self.lazy
+        return LazyOptional.empty()
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertFalse(
+            trace.accepted,
+            "Must not accept output where a removed import's bound name is still referenced"
+        )
+        violation_ids = [v["id"] for v in trace.diagnostic.get("constraint_violations", [])]
+        self.assertIn("MUST_NOT_USE_FABRIC_APIS", violation_ids)
+
+    def test_unused_forbidden_import_is_still_safely_removed(self) -> None:
+        """Sanity check: a forbidden import that ISN'T referenced elsewhere must still be removed and accepted -- the guard shouldn't make everything more conservative than necessary."""
+        source = """\
+import net.fabricmc.fabric
+from net.fabricmc import UnusedFabricImport
+
+class FabricCapabilityProvider:
+    def __init__(self):
+        self.handler = MyHandler()
+        self.lazy = LazyOptional.of(lambda: self.handler)
+
+    def getCapability(self, cap, side):
+        if cap == MY_CAP:
+            return self.lazy
+        return LazyOptional.empty()
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertTrue(
+            trace.accepted,
+            "An unused forbidden import must still be safely removable"
+        )
+        self.assertNotIn("net.fabricmc", final_graph.source)
+
+    def test_unused_dangling_statement_is_still_safely_removed(self) -> None:
+        """Sanity check: a forbidden statement with no externally-referenced binding (e.g. a bare call) must still be removed and accepted."""
+        source = """\
+import net.fabricmc.fabric
+from net.fabricmc import ServerLifecycleEvents
+
+class MixedIntentProviderTwo:
+    def __init__(self):
+        self.handler = MyHandler()
+        self.lazy = LazyOptional.of(lambda: self.handler)
+        ServerLifecycleEvents.SERVER_STARTED.register(self.on_start)
+
+    def on_start(self, server):
+        pass
+
+    def getCapability(self, cap, side):
+        if cap == MY_CAP:
+            return self.lazy
+        return LazyOptional.empty()
+"""
+        final_graph, final_state, trace = self._run(source)
+        self.assertTrue(trace.accepted)
+        self.assertNotIn("ServerLifecycleEvents", final_graph.source)
+
+    def test_forbidden_api_set_catches_from_import_variants(self) -> None:
+        """MUST_NOT_USE_FABRIC_APIS must catch `from net.fabricmc import X` directly, not just bare `import net.fabricmc...`."""
+        from tsam.constraint_graph import (
+            ProgramGraph, build_neoforge_constraint_graph_for_source, check_all_constraints,
+        )
+        source = """\
+from net.fabricmc import SomeFabricThing
+
+class SoleImportCase:
+    def getCapability(self, cap, side):
+        return LazyOptional.empty()
+"""
+        graph = ProgramGraph.from_python_source(source)
+        cg    = build_neoforge_constraint_graph_for_source(source)
+        results = check_all_constraints(graph, cg)
+        violated_ids = {r.constraint_id for r in results if r.violated}
+        self.assertIn(
+            "MUST_NOT_USE_FABRIC_APIS", violated_ids,
+            "A from-import of an arbitrary name from a forbidden module must still be caught"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

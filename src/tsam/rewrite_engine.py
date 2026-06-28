@@ -250,11 +250,76 @@ def register_capability(self, registrar: BlockCapabilityRegistrar):
 """
 
 
+def _names_bound_by_statement(stmt: ast.AST) -> set[str]:
+    """
+    Identify the binding(s) a statement introduces, as strings directly
+    comparable against _collect_subtree_refs()'s output (bare names for
+    ast.Name targets, unparsed dotted strings for ast.Attribute targets
+    like `self.fabric_thing`).
+    """
+    bound: set[str] = set()
+    if isinstance(stmt, ast.Import):
+        for alias in stmt.names:
+            bound.add(alias.asname or alias.name.split(".")[0])
+    elif isinstance(stmt, ast.ImportFrom):
+        for alias in stmt.names:
+            bound.add(alias.asname or alias.name)
+    elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        for t in targets:
+            if isinstance(t, ast.Name):
+                bound.add(t.id)
+            elif isinstance(t, ast.Attribute):
+                try:
+                    bound.add(ast.unparse(t))
+                except Exception:
+                    pass
+    return bound
+
+
+def _is_binding_referenced_elsewhere(
+    scope_node: ast.AST, stmt: ast.AST, bound_names: set[str],
+) -> bool:
+    """
+    True if any of `bound_names` is referenced anywhere in `scope_node`'s
+    subtree OUTSIDE of `stmt` itself. Used to refuse a removal that would
+    leave a dangling reference: deleting `self.x = forbidden_call()` when
+    `self.x` is used elsewhere in the class produces code that still
+    parses (passes MUST_COMPILE) but raises at runtime -- silently
+    accepting that is exactly the kind of fabricated-but-broken output
+    this architecture exists to prevent. Removal should refuse instead,
+    leaving the corresponding constraint violated so the system rejects
+    with a diagnostic rather than producing broken output.
+    """
+    if not bound_names:
+        return False
+    excluded_ids = {id(n) for n in ast.walk(stmt)}
+    for node in ast.walk(scope_node):
+        if id(node) in excluded_ids:
+            continue
+        if isinstance(node, ast.Name) and node.id in bound_names:
+            return True
+        if isinstance(node, ast.Attribute):
+            try:
+                if ast.unparse(node) in bound_names:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 def _rewrite_source_remove_forbidden_apis(source: str) -> str:
     """
     Remove import statements referencing forbidden (Fabric) APIs.
     Operates at source level for simplicity at Stage 0.
     Returns rewritten source.
+
+    Will NOT remove an import whose bound name is referenced elsewhere in
+    the file -- see _is_binding_referenced_elsewhere. Found by adversarial
+    testing: removing `from net.fabricmc import FabricHelperAlias` while
+    `FabricHelperAlias.get()` was still called elsewhere produced code
+    that parsed fine but raised NameError at runtime, and the system was
+    accepting it.
     """
     try:
         tree = ast.parse(source)
@@ -276,9 +341,22 @@ def _rewrite_source_remove_forbidden_apis(source: str) -> str:
                 forbidden in module
                 for forbidden in FABRIC_APIS
             )
-            if is_forbidden:
-                for lineno in range(node.lineno, (node.end_lineno or node.lineno) + 1):
-                    remove_linenos.add(lineno)
+            if not is_forbidden:
+                continue
+
+            bound = _names_bound_by_statement(node)
+            if bound and _is_binding_referenced_elsewhere(tree, node, bound):
+                # The imported name is actually used elsewhere in the file --
+                # removing just the import would leave a dangling NameError.
+                # Leave it; MUST_NOT_USE_FABRIC_APIS stays violated and the
+                # system reports a diagnostic instead of producing code that
+                # parses but breaks at runtime. Safely rewriting the USAGE
+                # site would require understanding what it does, which is
+                # outside Stage 0's deterministic rule scope.
+                continue
+
+            for lineno in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                remove_linenos.add(lineno)
 
     result = [
         line for i, line in enumerate(lines, start=1)
@@ -453,6 +531,14 @@ def _rewrite_source_remove_dangling_fabric_statements(source: str) -> str:
     registrant) -- that needs removing at the statement level, not the
     import level. Classes with NO capability evidence are left alone here;
     those are MUST_MATCH_KNOWN_PATTERN's job (reject, don't patch).
+
+    Will NOT remove a statement whose binding (an assignment target) is
+    referenced elsewhere in the same class -- see
+    _is_binding_referenced_elsewhere. Found by adversarial testing:
+    removing `self.fabric_thing = net.fabricmc.fabric.SomeHelper.create()`
+    while `self.fabric_thing` was still read inside getCapability produced
+    code that parsed fine but raised AttributeError at runtime, and the
+    system was accepting it.
     """
     try:
         tree = ast.parse(source)
@@ -469,6 +555,9 @@ def _rewrite_source_remove_dangling_fabric_statements(source: str) -> str:
             if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign)):
                 stmt_refs = _collect_subtree_refs(stmt)
                 if any(forbidden in ref for ref in stmt_refs for forbidden in FABRIC_APIS):
+                    bound = _names_bound_by_statement(stmt)
+                    if bound and _is_binding_referenced_elsewhere(node, stmt, bound):
+                        continue
                     start = stmt.lineno
                     end   = stmt.end_lineno or start
                     remove_linenos.update(range(start, end + 1))
